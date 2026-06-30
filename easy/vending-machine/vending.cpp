@@ -1,182 +1,169 @@
-#include <iostream>
-#include <memory>
-#include <stdexcept>
-#include <string>
-#include <unordered_map>
+#include <bits/stdc++.h>
+
 using namespace std;
 
-enum class Coin {
-    ONE = 1,
-    FIVE = 5,
-    TEN = 10,
-    TWENTY = 20
-};
+class VendingMachine;   // fundamental cycle: state <-> machine
 
-inline int valueof(Coin c) {
-    return static_cast<int>(c);
-}
-
+// ---------- Data ----------
 struct Product {
     string name;
-    string code;
-    int price = 0;
+    int price;
+    int qty;
 };
 
-class Inventory {
-    public:
-        void add(const Product& p, int qty){
-            auto it = entries_.find(p.code);
-            if(it ==entiries_.end()){
-                entries_[p.code] = {p, qty};
-            }else{
-                it->second.qty += qty;
-            }
-        }
-
-        bool hasStock(const string& code) const {
-            auto it = entries_.find(code);
-            return it != entries_.end() && it->second.qty > 0;
-        }
-
-        const Product& product(const string& code) const {
-            return entries_.at(code).product;
-        }
-
-        void reduceOne(const string& code){
-            entries_.at(code).qty--;
-
-        }
-
-    private:
-        struct Entry {
-            Product product;
-            int qty = 0;
-        };
-
-        unordered_map<string, Entry> entries_;
-
-}
-
-class VendingMachine;
-
-class State {
-    public:
-        virtual ~State() = default;
-        virtual void selectProduct(VendingMachine&, const string&) = 0;
-        virtual void insertCoin(VendingMachine&, Coin) = 0;
-        virtual Product dispense(VendingMachine&) = 0;
-        virtual void cancel(VendingMachine&) = 0;
-        virtual string name() const = 0;
+// ---------- State interface ----------
+class VendingState{
+  public:
+    virtual void insertMoney(VendingMachine* m , int amount) = 0;
+    virtual void selectProduct(VendingMachine* m, int code) = 0;
+    virtual void dispenseProduct(VendingMachine* m) = 0;
+    virtual void refund(VendingMachine* m) = 0;
+    virtual ~VendingState() = default;
 };
 
+// ---------- Context ----------
 class VendingMachine{
-    public: 
-       VendingMachine();
+  private:
+    VendingState* currentState;
+    VendingState* idle;
+    VendingState* hasMoney;
+    VendingState* dispense;
+    int balance = 0;
+    int selectedCode = -1;
+    map<int, Product> inventory;   // code -> product
 
-       void selectProduct(const string& code){
-        state_->selectProduct(*this, code);
-       }
+  public:
+    VendingMachine();    // body at bottom (needs concrete states)
+    ~VendingMachine();
 
-       void insertCoin(Coin c){
-        state_->insertCoin(*this, c);
-       }
+    void setState(VendingState* s){ currentState = s; }
 
-       Product dispense(){
-            return state_->dispense(*this);
-      }
+    VendingState* getIdle(){ return idle; }
+    VendingState* getHasMoney(){ return hasMoney; }
+    VendingState* getDispense(){ return dispense; }
 
-      void cancel(){
-        state_->cancel(*this);
-      }
+    // money
+    void addBalance(int amt){ balance += amt; }
+    int  getBalance(){ return balance; }
+    void resetBalance(){ balance = 0; }
 
-      void refill(const Product& p, int qty){
-        inventory_.add(p, qty);
-      }
+    // inventory
+    void addProduct(int code, const Product& p){ inventory[code] = p; }
+    bool hasStock(int code){ return inventory.count(code) && inventory[code].qty > 0; }
+    int  getPrice(int code){ return inventory[code].price; }
+    string getName(int code){ return inventory[code].name; }
+    void reduceStock(int code){ inventory[code].qty--; }
 
-      int collectCash(int c = cashBox_, cashBox_ = 0){
-        return c;
-      }
+    // selection
+    void setSelected(int code){ selectedCode = code; }
+    int  getSelected(){ return selectedCode; }
 
-      void setState(State* s){
-        state_ = s;
-      }
-
-      State* idle(){
-        return idle_.get();
-      }
-
-      State* hasMoney(){
-        return hasMoney_.get();
-      }
-
-      State* dispensing(){
-        return dispensing_.get();
-      }
-
-      Inventory& inventory(){
-        return inventory_;
-      }
-
-      int balance() const {
-        return balance_;
-      }
-
-      void addBalance(int amount){
-        balance_ += amount;
-      }
-
-      int refundBalance(){
-        int amount = balance_;
-        balance_ = 0;
-        return amount;
-      }
-
-      void bankBalance(){
-        cashBox += balance_;
-        balance_ = 0;
-      }
-
-      const string& selected() const {
-        return selectedCode_;
-      }
-
-      void setSelected(const string& code){
-        selectedCode_ = code;
-      }
-
-    private:
-        unique_ptr<State> idle_, hasMoney_, dispensing_;
-        State* state_ = nullptr;
-
-        Inventory inventory_;
-        int balance_ = 0;
-        int cashBox = 0;
-        string selectedCode_;
-
+    // public API -> delegates to current state
+    void insertMoney(int amount){ currentState->insertMoney(this, amount); }
+    void selectProduct(int code){ currentState->selectProduct(this, code); }
+    void dispenseProduct(){ currentState->dispenseProduct(this); }
+    void refund(){ currentState->refund(this); }
 };
 
-static string makeChange(int amount){
-    const int coins[] = {20, 10, 5, 1};
-    string out; 
-    for(int c : coins){
-        while(amount >= c){
-            amount -= c;
-            out += to_string(c) + " ";
-        }
+// ---------- Concrete states (all inline now: no sibling class ever named) ----------
+class IdleState : public VendingState{
+  public:
+    void insertMoney(VendingMachine* m, int amount) override {
+        m->addBalance(amount);
+        cout << "Money in: " << amount << " | balance=" << m->getBalance() << endl;
+        m->setState(m->getHasMoney());
     }
-    return out;
+    void selectProduct(VendingMachine* m, int code) override {
+        cout << "Insert Money First" << endl;
+    }
+    void dispenseProduct(VendingMachine* m) override {
+        cout << "Insert Money First" << endl;
+    }
+    void refund(VendingMachine* m) override {
+        cout << "Nothing to refund" << endl;
+    }
+};
+
+class HasMoneyState : public VendingState{
+  public:
+    void insertMoney(VendingMachine* m, int amount) override {
+        m->addBalance(amount);
+        cout << "Money in: " << amount << " | balance=" << m->getBalance() << endl;
+    }
+    void selectProduct(VendingMachine* m, int code) override {
+        if(!m->hasStock(code)){
+            cout << "Out of stock for code " << code << endl;
+            return;
+        }
+        if(m->getBalance() < m->getPrice(code)){
+            cout << "Insufficient money. Need " << m->getPrice(code)
+                 << ", have " << m->getBalance() << endl;
+            return;
+        }
+        m->setSelected(code);
+        cout << "Selected: " << m->getName(code) << endl;
+        m->setState(m->getDispense());
+    }
+    void dispenseProduct(VendingMachine* m) override {
+        cout << "Select a product first" << endl;
+    }
+    void refund(VendingMachine* m) override {
+        cout << "Refund: " << m->getBalance() << endl;
+        m->resetBalance();
+        m->setState(m->getIdle());
+    }
+};
+
+class DispenseState : public VendingState{
+  public:
+    void insertMoney(VendingMachine* m, int amount) override {
+        cout << "Dispensing in progress, cannot add money" << endl;
+    }
+    void selectProduct(VendingMachine* m, int code) override {
+        cout << "Already dispensing" << endl;
+    }
+    void dispenseProduct(VendingMachine* m) override {
+        int code = m->getSelected();
+        int change = m->getBalance() - m->getPrice(code);
+        m->reduceStock(code);
+        cout << "Dispensed: " << m->getName(code) << endl;
+        if(change > 0) cout << "Change returned: " << change << endl;
+        m->resetBalance();
+        m->setSelected(-1);
+        m->setState(m->getIdle());
+    }
+    void refund(VendingMachine* m) override {   // changed mind before collecting
+        cout << "Refund: " << m->getBalance() << endl;
+        m->resetBalance();
+        m->setSelected(-1);
+        m->setState(m->getIdle());
+    }
+};
+
+// ---------- ctor/dtor: only place that knows every concrete state ----------
+VendingMachine::VendingMachine(){
+    idle     = new IdleState();
+    hasMoney = new HasMoneyState();
+    dispense = new DispenseState();
+    currentState = idle;
+}
+VendingMachine::~VendingMachine(){
+    delete idle;
+    delete hasMoney;
+    delete dispense;
 }
 
-class IdleState : public State{
-    public: 
-        void selectproduct(VendingMachine& m, const string& code) override{
-            if(!m.inventory().hasStock(code)){
-                throw invalid_argument("Out of Stock" + code);
-            } else {
-                m.setSelected(code);
-                m.setState(m.hasMoney());
-            }
-        }
+// ---------- demo ----------
+int main(){
+    VendingMachine m;
+    m.addProduct(1, {"Coke", 25, 2});
+    m.addProduct(2, {"Water", 15, 5});
 
-        
-};
+    m.selectProduct(1);    // reject: insert money first
+    m.insertMoney(10);     // idle -> hasMoney
+    m.insertMoney(20);     // top up, balance=30
+    m.selectProduct(1);    // ok -> dispense
+    m.dispenseProduct();   // dispense Coke, change 5, -> idle
+
+    return 0;
+}
