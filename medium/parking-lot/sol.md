@@ -1,407 +1,462 @@
-# Parking Lot — Step-by-Step Solution Thinking
+# Parking Lot — LLD Interview Guide (C++, beginner-friendly)
 
-This document walks you from a blank page to a complete C++ solution, explaining **how to think** at every step. The goal is the reasoning that makes the **Strategy pattern** (pluggable allocation + pricing) feel inevitable rather than memorized.
-
----
-
-## Step 0 — Read the problem like an interviewer wrote it
-
-Mine the hard constraints first — they decide the design:
-
-1. *"Spot-allocation strategy **must be pluggable** (nearest-to-entrance, first-available, per-floor balancing)."* → This is **the** thing being tested. A hardcoded "scan floors for first empty spot" answer is a fail. Allocation is a **Strategy** injected into the lot.
-2. *"Pricing strategy **must be pluggable** (flat hourly, per-vehicle-type, day/night, free first 15 min)."* → A second, independent **Strategy**. Fee math must not live inside `unparkVehicle`.
-3. *"**Thread safety**: concurrent entries must never assign the same spot twice."* → The differentiator. The find-spot → claim-spot step must be **atomic**, or two cars race onto the same spot. Naive `find()` then `occupy()` with no lock is a fail.
-4. *"Reject entry when **no compatible spot** is available."* → A `VehicleType` → spot-compatibility rule, and a clean rejection path (throw).
-5. Follow-ups name the seams: EV/handicapped spots (more spot subtypes), reservations, find-my-car, lost-ticket penalty. We leave room, don't build them all.
-
-> **Thinking habit:** when the prompt says a behaviour "must be pluggable," it is literally naming **Strategy**. Two pluggable axes (allocation, pricing) = two independent strategy interfaces.
+A one-hour walkthrough with code you can read top to bottom. The point of an LLD round is
+**not** clever syntax — it's showing you clarify scope, pick clean objects, apply good OOP
+(**encapsulation!**), and explain trade-offs. This version keeps the code simple *and*
+properly encapsulated: **data is private, behaviour is public.** A short **"Level it up"**
+section at the end shows what a senior would add — say those things out loud even if you
+don't code them.
 
 ---
 
-## Step 1 — Find the nouns → these become your classes
+## 0. Time budget (1 hour)
 
-Read the prose and circle the nouns: *lot, floor, spot, vehicle, type, ticket, receipt, gate, fee, allocation, pricing.*
+| Phase | Time | What you're doing |
+| --- | --- | --- |
+| Clarify requirements | 0–8 min | Ask questions, lock scope out loud |
+| Entities + relationships | 8–15 min | Sketch classes, name the pieces |
+| Code core classes | 15–45 min | Enums → Vehicle → Spot → Floor → Ticket → Lot |
+| Demo / `main` walkthrough | 45–55 min | Park, unpark, prove it works |
+| Extensions + Q&A | 55–60 min | How you'd harden and grow it |
 
-Group them into responsibilities:
-
-| Class | Owns | Why it exists |
-|-------|------|---------------|
-| `VehicleType` (enum) | MOTORCYCLE / CAR / TRUCK | the kind of vehicle, drives spot compatibility |
-| `Vehicle` | license plate, type | who is parking |
-| `ParkingSpot` | id, spot type, occupied flag, current vehicle | smallest unit of parkable space |
-| `ParkingFloor` | a collection of spots | geometry + per-floor locking unit |
-| `Ticket` | id, vehicle, spot, entry time | the open contract for one parking session |
-| `Receipt` | ticket + computed fee | the closed, paid result on exit |
-| `SpotAllocationStrategy` (interface) | "where should this vehicle go?" | pluggable placement policy |
-| `PricingStrategy` (interface) | "what does this session cost?" | pluggable fee policy |
-| `ParkingLot` (the orchestrator) | floors + the two strategies + open tickets | issues tickets, closes them, enforces thread safety |
-
-> **Thinking habit:** Strategy pattern = one **client** (the lot) + one **strategy interface** per pluggable axis + N **concrete strategies**. Two "must be pluggable" requirements means two interfaces — don't fold them into one.
+Rule of thumb: **don't write a class until you've said your assumptions aloud and the
+interviewer has agreed.**
 
 ---
 
-## Step 2 — Pin the public interface (the contract)
+## 1. Clarifying questions to ask the interviewer
 
-Given to us — lock it before internals:
+Ask these first, grouped so you sound structured. For each, the **default** is what to
+assume if they say "you decide."
+
+**Scope & structure**
+
+- One lot with multiple floors, or many lots? → *One lot, multiple floors.*
+- Multiple entrances issuing tickets at once? → *Assume yes (note it as a concurrency concern).*
+- Roughly how many spots? → *A few thousand, fits in memory.*
+
+**Vehicles & spots**
+
+- Which vehicle types? → *Motorcycle, Car, Truck.*
+- Which spot sizes, and the fit rule? → *Small/Medium/Large; bike fits any, car needs ≥ Medium, truck needs Large.*
+- Can one vehicle take multiple spots? → *No — one vehicle, one spot.*
+- Special spots (EV, handicapped)? → *Out of scope v1; mention as an extension.*
+
+**Pricing & payment**
+
+- Flat, hourly, or per vehicle type? → *Hourly, per type, minimum 1 hour, rounded up.*
+- Payment methods / lost ticket? → *Out of scope v1.*
+
+**Assignment policy**
+
+- Nearest spot, any free spot, load-balanced? → *Nearest-first (first free compatible bay).*
+
+---
+
+## 2. Locked scope (say this back before coding)
+
+> "So v1: one lot, multiple floors. Three vehicle types, three spot sizes with a fit
+rule. Hourly pricing by vehicle type. Nearest-free-spot assignment. Ticket in, fee out.
+I'll keep pricing and spot-finding simple for now and mention how I'd make them swappable
+later. Sound good?"
+> 
+
+That agreement is the contract for the rest of the hour.
+
+---
+
+## 3. Entities & relationships
+
+```
+ParkingLot            the front door; the only thing the outside world calls
+ ├── has many  ParkingFloor        one level
+ │                └── has many ParkingSpot   one bay (owns its size + who's in it)
+ │                                   └── points to a Vehicle while occupied
+ ├── keeps a list of Ticket        one per parked vehicle
+ └── calculateFee()  is a private helper (pricing is an internal detail)
+
+Vehicle  ── is the base of ──▶  Motorcycle | Car | Truck
+```
+
+Design choices worth saying out loud:
+
+- **Encapsulation: data private, behaviour public.** No outside code flips a bay's
+`occupied` flag directly — it calls `park()` / `leave()`. Each class guards its own state.
+- **Put each rule on the object that owns the data it needs.** `canFit` lives on
+`ParkingSpot` because it depends on the bay's size. Pricing lives inside `ParkingLot`
+as a private helper.
+- **The spot points at the vehicle, it doesn't own it.** The driver creates the car (in
+`main`); the bay just holds a non-owning pointer that's `nullptr` when empty.
+- **`ParkingLot` is the front door.** Everything goes through its public methods; nobody
+reaches into floors or spots from outside.
+
+---
+
+## 4. The implementation (single file)
+
+Build it in this order on the board. The file below is the whole thing.
 
 ```cpp
+// ============================================================================
+//  PARKING LOT  —  Low-Level Design (beginner-friendly, properly encapsulated)
+//  C++.  Compile:  g++ -std=c++17 parking_lot_simple.cpp -o parking_lot
+//  Rule of thumb used here: data is PRIVATE, behaviour is PUBLIC.
+//  Each class guards its own state; the outside world talks through methods.
+// ============================================================================
+#include <iostream>
+#include <string>
+#include <vector>
+#include <cmath>      // for ceil()
+
+using namespace std;
+
+// ------------------------------------------------------------- Enums --------
 enum class VehicleType { MOTORCYCLE, CAR, TRUCK };
+enum class SpotType    { SMALL, MEDIUM, LARGE };
 
-class SpotAllocationStrategy {        // Strategy #1
+string toString(VehicleType type) {
+    if (type == VehicleType::MOTORCYCLE) return "Motorcycle";
+    if (type == VehicleType::CAR)        return "Car";
+    if (type == VehicleType::TRUCK)      return "Truck";
+    return "Unknown";
+}
+
+// ------------------------------------------------------------ Vehicle -------
+// Data is private; you can only read it through getters.
+class Vehicle {
+private:
+    string      licensePlate_;
+    VehicleType type_;
 public:
-    virtual ParkingSpot* findSpot(VehicleType, const ParkingLot&) = 0;
-    virtual ~SpotAllocationStrategy() = default;
+    Vehicle(string plate, VehicleType type) {
+        licensePlate_ = plate;
+        type_ = type;
+    }
+    string      getLicensePlate() const { return licensePlate_; }
+    VehicleType getType()         const { return type_; }
 };
 
-class PricingStrategy {               // Strategy #2
+class Motorcycle : public Vehicle {
 public:
-    virtual double calculate(const Ticket&) const = 0;
-    virtual ~PricingStrategy() = default;
+    Motorcycle(string plate) : Vehicle(plate, VehicleType::MOTORCYCLE) {}
 };
-
-class ParkingLot {
+class Car : public Vehicle {
 public:
-    Ticket  parkVehicle(const Vehicle& v);     // throws if full
-    Receipt unparkVehicle(const Ticket& t);    // computes fee, frees spot
-    bool    isFull(VehicleType) const;
+    Car(string plate) : Vehicle(plate, VehicleType::CAR) {}
 };
-```
-
-Decisions baked in here:
-- **Strategies are injected**, not built inside `ParkingLot`. The lot depends on the *interfaces*, never on a concrete policy — that's the whole point.
-- **No compatible spot → throw** (`std::runtime_error`). Clean, testable, no silent "parked nowhere."
-- `parkVehicle` returns a `Ticket` by value (the open session); `unparkVehicle` returns a `Receipt` (the priced, closed session). The two value types make "open vs. closed" explicit.
-
-> **Thinking habit:** the interface is a promise. The strategies appear *in the constructor*, not as `if`s inside the methods — that's how you prove the policy is pluggable.
-
----
-
-## Step 3 — Model the leaves: `Vehicle`, `ParkingSpot`, `Ticket`, `Receipt`
-
-Bottom-up: things with no dependencies first. A vehicle is just identity + type.
-
-```cpp
-struct Vehicle {
-    std::string plate;
-    VehicleType type;
+class Truck : public Vehicle {
+public:
+    Truck(string plate) : Vehicle(plate, VehicleType::TRUCK) {}
 };
-```
 
-`ParkingSpot` is the unit that gets claimed. Give it a *spot type* (which vehicle sizes it accepts) and an occupancy flag. The `tryClaim` / `release` methods below become the atomic primitive for concurrency in Step 5 — design them now.
-
-```cpp
+// ------------------------------------------------------- ParkingSpot --------
+// A bay owns its state. Nobody can flip 'occupied' directly — they must call
+// park()/leave(). The fit rule lives here because it depends on the bay's size.
 class ParkingSpot {
-public:
-    ParkingSpot(int id, VehicleType spotType) : id_(id), spotType_(spotType) {}
-
-    int  id() const         { return id_; }
-    VehicleType type() const { return spotType_; }
-    bool isFree() const     { return !occupied_; }
-
-    // A MOTORCYCLE fits a motorcycle spot; a CAR fits a compact spot, etc.
-    // (Simple 1:1 here; relax to "small fits in large" if the prompt asks.)
-    bool fits(VehicleType v) const { return v == spotType_; }
-
-    // Atomic claim: returns true only if THIS call flipped free -> occupied.
-    // The exchange is the concurrency primitive (see Step 5).
-    bool tryClaim()  { bool was = occupied_; occupied_ = true; return !was; }
-    void release()   { occupied_ = false; }
-
 private:
-    int         id_;
-    VehicleType spotType_;
-    bool        occupied_ = false;
-};
-```
+    string   id_;
+    SpotType type_;
+    bool     occupied_;
+    Vehicle* parkedVehicle_;   // non-owning: points at the car while parked
 
-`Ticket` is the open contract; `Receipt` is the closed one. Keep them plain.
-
-```cpp
-using Clock     = std::chrono::system_clock;
-using TimePoint = std::chrono::time_point<Clock>;
-
-struct Ticket {
-    int          id;
-    Vehicle      vehicle;
-    ParkingSpot* spot;        // non-owning: the lot owns the spot
-    TimePoint    entryTime;
-};
-
-struct Receipt {
-    Ticket    ticket;
-    TimePoint exitTime;
-    double    fee;
-};
-```
-
-> **Thinking habit:** build bottom-up, and design a leaf's *mutating* methods (`tryClaim`/`release`) with the hard requirement (atomic assignment) already in mind. The leaf is where concurrency is won or lost.
-
----
-
-## Step 4 — The key insight: two independent Strategies, injected
-
-This is the heart of the problem. Allocation and pricing are **orthogonal** policies — neither knows about the other — so each gets its own interface and its own concrete implementation.
-
-```
-        ParkingLot (client)
-          │ holds  allocator_ ──────────► SpotAllocationStrategy
-          │                                ▲          ▲
-          │                          FirstAvailable  NearestToEntrance ...
-          │
-          │ holds  pricer_ ─────────────► PricingStrategy
-          │                                ▲          ▲
-          │                          FlatHourly   PerVehicleType ...
-          └── parkVehicle() asks allocator_; unparkVehicle() asks pricer_
-```
-
-Implement **one** of each behind the interfaces (the task asks for one apiece).
-
-**Allocation — first available compatible spot:**
-
-```cpp
-class FirstAvailableStrategy : public SpotAllocationStrategy {
 public:
-    // Walk floors in order, return the first free spot that fits the vehicle.
-    // Returns nullptr if none — the lot turns that into a thrown rejection.
-    ParkingSpot* findSpot(VehicleType v, const ParkingLot& lot) override;
-    // (definition after ParkingLot is declared — it reads lot.floors())
-};
-```
-
-**Pricing — flat hourly rate, rounding up partial hours:**
-
-```cpp
-class FlatHourlyPricing : public PricingStrategy {
-public:
-    explicit FlatHourlyPricing(double ratePerHour) : rate_(ratePerHour) {}
-
-    double calculate(const Ticket& t) const override {
-        auto now     = Clock::now();
-        auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
-                           now - t.entryTime).count();
-        // Round partial hours UP — standard parking billing.
-        long hours = (seconds + 3599) / 3600;
-        if (hours < 1) hours = 1;            // minimum one hour
-        return static_cast<double>(hours) * rate_;
+    ParkingSpot(string id, SpotType type) {
+        id_ = id;
+        type_ = type;
+        occupied_ = false;
+        parkedVehicle_ = nullptr;
     }
-private:
-    double rate_;
+
+    string getId() const { return id_; }
+    bool   isFree() const { return !occupied_; }
+
+    // Can this vehicle fit in this bay? Bike fits any, car >= Medium, truck Large.
+    bool canFit(VehicleType vt) const {
+        if (vt == VehicleType::MOTORCYCLE) return true;
+        if (vt == VehicleType::CAR)   return type_ == SpotType::MEDIUM || type_ == SpotType::LARGE;
+        if (vt == VehicleType::TRUCK) return type_ == SpotType::LARGE;
+        return false;
+    }
+
+    void park(Vehicle* vehicle) {
+        parkedVehicle_ = vehicle;
+        occupied_ = true;
+    }
+    void leave() {
+        parkedVehicle_ = nullptr;
+        occupied_ = false;
+    }
 };
-```
 
-Note `PricingStrategy::calculate` takes only a `const Ticket&` — everything it needs (entry time, vehicle type, spot type) is reachable from the ticket. A *per-vehicle-type* pricer would switch on `t.vehicle.type`; a *day/night* pricer would look at `t.entryTime`. **Same interface, different policy** — that's the win the interviewer is probing.
-
-> **Thinking habit:** when two requirements both say "pluggable," check whether they're independent. If neither policy needs the other's data, give each its own interface — never one mega-strategy.
-
----
-
-## Step 5 — The concurrency answer: atomic claim, lock per floor
-
-This is the non-functional differentiator. The danger is the classic check-then-act race:
-
-```
-Thread A: findSpot() -> spot #7 is free
-Thread B: findSpot() -> spot #7 is free   (A hasn't claimed yet)
-Thread A: occupy #7
-Thread B: occupy #7                        // two cars, one spot — BUG
-```
-
-The fix: **the find-and-claim must be one atomic step.** Two clean ways to say it in an interview:
-
-1. **Lock around the claim.** Take a mutex (one per floor keeps contention low), then *re-check* the spot is free and claim it under the lock. Cheap and obviously correct.
-2. **Lock-free atomic flag.** Make occupancy a `std::atomic<bool>` and claim with `compare_exchange_strong(expected=false, desired=true)` — only the thread that flips `false→true` wins. No mutex, scales better.
-
-We'll show the lock-per-floor version (easiest to reason about) and re-validate after locking, because `findSpot` ran *outside* the lock and the spot may have been taken meanwhile:
-
-```cpp
+// ------------------------------------------------------- ParkingFloor -------
+// A floor owns its bays. It hands back a bay through methods, never the list.
 class ParkingFloor {
-public:
-    explicit ParkingFloor(int number) : number_(number) {}
-
-    void addSpot(std::unique_ptr<ParkingSpot> s) { spots_.push_back(std::move(s)); }
-    const std::vector<std::unique_ptr<ParkingSpot>>& spots() const { return spots_; }
-
-    // Lock guards every claim on THIS floor so the same spot can't go twice.
-    std::mutex& mutex() { return mutex_; }
-    int number() const  { return number_; }
-
 private:
-    int number_;
-    std::vector<std::unique_ptr<ParkingSpot>> spots_;
-    std::mutex mutex_;
-};
-```
+    int                 number_;
+    vector<ParkingSpot> spots_;
 
-> **Thinking habit:** "never assign the same spot twice" = make *find + claim* atomic. Either lock the smallest unit that contains the spot (per-floor mutex) or use a CAS on the occupancy flag. Re-validate inside the lock if the search ran outside it.
-
----
-
-## Step 6 — Orchestrate with `ParkingLot`: park, unpark, reject
-
-`ParkingLot` is the client. It owns the floors and *holds* the two strategies (injected). Its `parkVehicle` must, in order:
-
-1. Ask the **allocation strategy** for a candidate spot.
-2. If none → **reject** (throw).
-3. **Claim it under the floor lock** (re-validate, in case it was taken). Retry/re-ask if the claim loses the race.
-4. Issue and record a `Ticket`.
-
-`unparkVehicle` must: look up the open ticket → ask the **pricing strategy** for the fee → free the spot → return a `Receipt`.
-
-```cpp
-class ParkingLot {
 public:
-    ParkingLot(std::vector<std::unique_ptr<ParkingFloor>> floors,
-               std::unique_ptr<SpotAllocationStrategy>    allocator,
-               std::unique_ptr<PricingStrategy>           pricer)
-        : floors_(std::move(floors)),
-          allocator_(std::move(allocator)),
-          pricer_(std::move(pricer)) {}
+    ParkingFloor(int number) { number_ = number; }
 
-    const std::vector<std::unique_ptr<ParkingFloor>>& floors() const { return floors_; }
+    int getNumber() const { return number_; }
 
-    Ticket parkVehicle(const Vehicle& v) {
-        // Re-ask the strategy until we actually win a claim (or run out).
-        for (;;) {
-            ParkingSpot* spot = allocator_->findSpot(v.type, *this);
-            if (!spot)
-                throw std::runtime_error("lot full for requested vehicle type");
+    void addSpot(string id, SpotType type) {
+        spots_.push_back(ParkingSpot(id, type));
+    }
 
-            ParkingFloor* floor = floorOf(spot);
-            std::lock_guard<std::mutex> lock(floor->mutex());
-
-            // Re-validate under the lock: findSpot ran unlocked.
-            if (!spot->isFree() || !spot->tryClaim())
-                continue;                       // lost the race — ask again
-
-            Ticket t{ nextTicketId_++, v, spot, Clock::now() };
-            openTickets_[t.id] = t;
-            return t;
+    // First free bay that fits the vehicle, or nullptr if none on this floor.
+    ParkingSpot* findFreeSpot(VehicleType vt) {
+        for (ParkingSpot& spot : spots_) {
+            if (spot.isFree() && spot.canFit(vt)) return &spot;
         }
-    }
-
-    Receipt unparkVehicle(const Ticket& t) {
-        auto it = openTickets_.find(t.id);
-        if (it == openTickets_.end())
-            throw std::invalid_argument("unknown or already-closed ticket");
-
-        Ticket open = it->second;
-        double fee  = pricer_->calculate(open);   // pricing strategy decides cost
-
-        open.spot->release();                      // free the spot
-        openTickets_.erase(it);
-        return Receipt{ open, Clock::now(), fee };
-    }
-
-    bool isFull(VehicleType type) const {
-        for (const auto& f : floors_)
-            for (const auto& s : f->spots())
-                if (s->fits(type) && s->isFree()) return false;
-        return true;
-    }
-
-private:
-    ParkingFloor* floorOf(ParkingSpot* spot) {
-        for (const auto& f : floors_)
-            for (const auto& s : f->spots())
-                if (s.get() == spot) return f.get();
         return nullptr;
     }
 
-    std::vector<std::unique_ptr<ParkingFloor>> floors_;
-    std::unique_ptr<SpotAllocationStrategy>    allocator_;
-    std::unique_ptr<PricingStrategy>           pricer_;
-    std::unordered_map<int, Ticket>            openTickets_;
-    int                                        nextTicketId_ = 1;
-};
-
-// Now that ParkingLot is fully declared, define the allocator that reads it.
-ParkingSpot* FirstAvailableStrategy::findSpot(VehicleType v, const ParkingLot& lot) {
-    for (const auto& floor : lot.floors())
-        for (const auto& spot : floor->spots())
-            if (spot->fits(v) && spot->isFree())
-                return spot.get();
-    return nullptr;
-}
-```
-
-Two design wins to call out in an interview:
-- **The lot never contains pricing or allocation logic** — it only *calls* the injected strategies. Swap a strategy in the constructor and behaviour changes with zero edits to `ParkingLot`. That's open/closed.
-- **The retry loop + re-validate under lock** is the honest concurrency story: the unlocked search can go stale, so we confirm and claim atomically, and re-ask if we lost.
-
-> **Thinking habit:** the client *coordinates* (find → claim → record); it *delegates* every policy decision. If `parkVehicle` ever grows a `switch` on vehicle type, a strategy leaked into the client.
-
----
-
-## Step 7 — Prove it with a tiny driver
-
-Always show a `main` that exercises a park, an unpark with a fee, and a rejection. It doubles as your test.
-
-```cpp
-#include <iostream>
-
-int main() {
-    // Build one floor: 1 motorcycle spot, 1 car spot.
-    auto floor = std::make_unique<ParkingFloor>(1);
-    floor->addSpot(std::make_unique<ParkingSpot>(101, VehicleType::MOTORCYCLE));
-    floor->addSpot(std::make_unique<ParkingSpot>(102, VehicleType::CAR));
-
-    std::vector<std::unique_ptr<ParkingFloor>> floors;
-    floors.push_back(std::move(floor));
-
-    // Inject one allocation strategy + one pricing strategy.
-    ParkingLot lot(std::move(floors),
-                   std::make_unique<FirstAvailableStrategy>(),
-                   std::make_unique<FlatHourlyPricing>(40.0));   // 40 per hour
-
-    // Park a car -> gets spot 102.
-    Vehicle car{ "KA-01-1234", VehicleType::CAR };
-    Ticket  t = lot.parkVehicle(car);
-    std::cout << "Parked at spot " << t.spot->id() << "\n";   // 102
-
-    // Second car -> no compatible spot left -> rejected, not crashed.
-    try {
-        lot.parkVehicle(Vehicle{ "KA-02-9999", VehicleType::CAR });
-    } catch (const std::exception& e) {
-        std::cout << "Rejected: " << e.what() << "\n";        // lot full ...
+    // Look a bay up by id (used when a car leaves).
+    ParkingSpot* findSpotById(string id) {
+        for (ParkingSpot& spot : spots_) {
+            if (spot.getId() == id) return &spot;
+        }
+        return nullptr;
     }
 
-    // Unpark -> fee computed by the pricing strategy, spot freed.
-    Receipt r = lot.unparkVehicle(t);
-    std::cout << "Fee: " << r.fee << "\n";                    // >= 40 (min 1 hr)
+    int countFree() {
+        int count = 0;
+        for (ParkingSpot& spot : spots_) {
+            if (spot.isFree()) count++;
+        }
+        return count;
+    }
+};
+
+// ------------------------------------------------------------- Ticket -------
+class Ticket {
+private:
+    string      id_;
+    string      spotId_;
+    string      plate_;
+    VehicleType vehicleType_;
+
+public:
+    Ticket(string id, string spotId, string plate, VehicleType type) {
+        id_ = id;
+        spotId_ = spotId;
+        plate_ = plate;
+        vehicleType_ = type;
+    }
+    string      getId()          const { return id_; }
+    string      getSpotId()      const { return spotId_; }
+    VehicleType getVehicleType() const { return vehicleType_; }
+};
+
+// ----------------------------------------------------------- ParkingLot -----
+// The front door. All state is private; the world uses the public methods only.
+class ParkingLot {
+private:
+    vector<ParkingFloor> floors_;
+    vector<Ticket>       tickets_;
+    int                  ticketCounter_ = 0;
+
+    // Pricing is an internal detail, so it's a private helper.
+    double calculateFee(VehicleType type, double hours) {
+        double billableHours = ceil(hours);        // round up: 2.5h -> 3h
+        if (billableHours < 1) billableHours = 1;  // minimum one hour
+
+        double rate = 0;
+        if (type == VehicleType::MOTORCYCLE) rate = 10;
+        else if (type == VehicleType::CAR)   rate = 20;
+        else if (type == VehicleType::TRUCK) rate = 40;
+
+        return rate * billableHours;
+    }
+
+public:
+    // ---- setup ----
+    void addFloor(int number) {
+        floors_.push_back(ParkingFloor(number));
+    }
+    void addSpot(string id, SpotType type) {
+        floors_.back().addSpot(id, type);   // add to the most recent floor
+    }
+
+    // ---- park: ask each floor (in order) for a free spot ----
+    void parkVehicle(Vehicle* vehicle) {
+        for (ParkingFloor& floor : floors_) {
+            ParkingSpot* spot = floor.findFreeSpot(vehicle->getType());
+            if (spot != nullptr) {
+                spot->park(vehicle);
+
+                ticketCounter_++;
+                string ticketId = "T" + to_string(ticketCounter_);
+                tickets_.push_back(Ticket(ticketId, spot->getId(),
+                                          vehicle->getLicensePlate(), vehicle->getType()));
+
+                cout << "[PARK]  " << toString(vehicle->getType()) << " "
+                     << vehicle->getLicensePlate() << " -> spot " << spot->getId()
+                     << "  (ticket " << ticketId << ")\n";
+                return;
+            }
+        }
+        cout << "[FULL]  no spot for " << toString(vehicle->getType())
+             << " " << vehicle->getLicensePlate() << "\n";
+    }
+
+    // ---- unpark: free the bay and charge the driver ----
+    double unparkVehicle(string ticketId, double hours) {
+        for (int i = 0; i < (int)tickets_.size(); i++) {
+            if (tickets_[i].getId() == ticketId) {
+                Ticket ticket = tickets_[i];
+
+                for (ParkingFloor& floor : floors_) {
+                    ParkingSpot* spot = floor.findSpotById(ticket.getSpotId());
+                    if (spot != nullptr) spot->leave();
+                }
+
+                double fee = calculateFee(ticket.getVehicleType(), hours);
+                cout << "[EXIT]  ticket " << ticketId << " from spot "
+                     << ticket.getSpotId() << "  | " << hours << "h -> fee $" << fee << "\n";
+
+                tickets_.erase(tickets_.begin() + i);
+                return fee;
+            }
+        }
+        cout << "[ERROR] invalid ticket " << ticketId << "\n";
+        return -1;
+    }
+
+    void printAvailability() {
+        cout << "--- availability ---\n";
+        for (ParkingFloor& floor : floors_) {
+            cout << "  floor " << floor.getNumber() << ": "
+                 << floor.countFree() << " free\n";
+        }
+    }
+};
+
+// ---------------------------------------------------------------- demo ------
+int main() {
+    ParkingLot lot;
+
+    lot.addFloor(1);
+    lot.addSpot("F1-S1", SpotType::SMALL);
+    lot.addSpot("F1-M1", SpotType::MEDIUM);
+    lot.addSpot("F1-L1", SpotType::LARGE);
+
+    lot.addFloor(2);
+    lot.addSpot("F2-M1", SpotType::MEDIUM);
+    lot.addSpot("F2-L1", SpotType::LARGE);
+
+    lot.printAvailability();
+
+    Motorcycle bike("KA01-1111");
+    Car        car("KA02-2222");
+    Truck      truck("KA03-3333");
+
+    lot.parkVehicle(&bike);
+    lot.parkVehicle(&car);
+    lot.parkVehicle(&truck);
+    lot.printAvailability();
+
+    lot.unparkVehicle("T2", 2.5);   // car: ceil(2.5)=3, rate 20 -> $60
+    lot.printAvailability();
+
+    Car car2("KA04-4444");          // reuses F1-M1 that the first car freed
+    lot.parkVehicle(&car2);
+    lot.printAvailability();
 
     return 0;
 }
 ```
 
-> **Thinking habit:** a driver that hits park, *reject-when-full*, and unpark-with-fee proves the happy path, the error path, and that both strategies actually fire — worth more than paragraphs.
+### Verified output
+
+```
+--- availability ---
+  floor 1: 3 free
+  floor 2: 2 free
+[PARK]  Motorcycle KA01-1111 -> spot F1-S1  (ticket T1)
+[PARK]  Car KA02-2222 -> spot F1-M1  (ticket T2)
+[PARK]  Truck KA03-3333 -> spot F1-L1  (ticket T3)
+--- availability ---
+  floor 1: 0 free
+  floor 2: 2 free
+[EXIT]  ticket T2 from spot F1-M1  | 2.5h -> fee $60
+--- availability ---
+  floor 1: 1 free
+  floor 2: 2 free
+[PARK]  Car KA04-4444 -> spot F1-M1  (ticket T4)
+--- availability ---
+  floor 1: 0 free
+  floor 2: 2 free
+```
 
 ---
 
-## Step 8 — Talk through the follow-ups (don't necessarily code them all)
+## 5. Walk the interviewer through it
 
-Show the seams are already there:
+Say these lines as you point at the code — this is what earns marks:
 
-1. **EV-charging / handicapped-reserved spots.** Add spot subtypes (or an `attributes` field) and a new `SpotAllocationStrategy` that prefers/filters them (e.g. `EvFirstStrategy`). Compatibility moves into `fits()`. **New strategy + richer spot, the lot is untouched.**
-
-2. **Reservation / pre-booking.** A reserved spot is one claimed ahead of arrival. Add a `reserve(spotId, window)` that flips occupancy with a future ticket; `findSpot` skips reserved spots. The atomic-claim primitive from Step 5 already prevents double-booking a reserved spot.
-
-3. **Find-my-car / real-time availability.** The lot already knows every spot's occupancy. Index `plate → spot` on park for find-my-car; expose `availableCount(VehicleType, floor)` (a counter you maintain incrementally on claim/release) for a live display — same *incremental state* trick as any counter.
-
-4. **Lost-ticket handling + flat penalty.** Since `unparkVehicle` delegates to a `PricingStrategy`, lost-ticket is just *another pricing path*: a `LostTicketPricing` (or a flag the pricer reads) that charges a flat max-day penalty. **No change to the lot** — the pricing axis already absorbs it.
-
-> **Thinking habit:** good LLD answers end by mapping each follow-up onto an existing seam — "that's a new allocation strategy," "that's a new pricing strategy," "that's a counter." If a follow-up forces an edit to the client, your abstraction was wrong.
+- **Encapsulation is deliberate.** Every field is `private`; the outside world only ever
+calls methods. A bay can't be marked occupied except by `park()`. State each class
+protects its own invariants.
+- **Enums** name the choices so we never pass raw strings around.
+- **Vehicle + subclasses** show the hierarchy. Each subclass just sets its type.
+- **`ParkingSpot::canFit`** is the fit rule, living on the object that has the size it needs.
+- **`ParkingFloor::findFreeSpot`** hides the inner loop — the lot asks the floor, it doesn't
+reach into the floor's list of spots.
+- **`ParkingLot::parkVehicle`** is nearest-first: ask each floor in order for a free spot,
+take the first one, issue a ticket, stop. Nearest-first *is* the loop order.
+- **`ParkingLot::calculateFee`** is a private helper — pricing is an internal detail, not
+something callers should see or depend on.
+- **`ParkingLot` is the front door** — `main` only calls `addFloor`, `addSpot`,
+`parkVehicle`, `unparkVehicle`, `printAvailability`.
 
 ---
 
-## Recap — the reasoning skeleton you can reuse
+## 6. Level it up (say these out loud — this is the senior signal)
 
-1. **Mine the constraints** — two "must be pluggable" lines name **two Strategies**; "never assign a spot twice" names **atomic claim**.
-2. **Nouns → classes**, one responsibility each (`Vehicle`, `ParkingSpot`, `Floor`, `Ticket`, `Receipt`, two strategies, `ParkingLot`).
-3. **Interface first** — strategies arrive via the constructor; the lot depends on interfaces, not policies.
-4. **Leaves first** (`Vehicle`, `ParkingSpot` with `tryClaim`/`release`), then the strategies, then the orchestrator.
-5. **Two orthogonal Strategies** — allocation and pricing never reference each other.
-6. **Concurrency = make find + claim atomic** (per-floor lock + re-validate, or CAS on the flag); retry if you lose the race.
-7. **Client coordinates, strategies decide** — no `switch` on vehicle type inside `ParkingLot`.
-8. **Driver as proof**, then **map every follow-up to a seam** (new strategy / counter), never an edit to the client.
+The code above is intentionally simple. Here's how you'd grow it, and *why*:
 
-Follow that skeleton on any "system with pluggable policies + a contended shared resource" LLD (ride-matching, seat booking, ad allocation) and the Strategy pattern plus the atomic-claim answer fall out almost mechanically.
+- **Make pricing swappable (Strategy pattern).** `calculateFee` is a private helper today.
+For day/night rates, weekend surge, or a free first 15 minutes, promote it to a
+`FeeStrategy` interface with subclasses and hand one to the lot. New rule = new class.
+Same idea for spot-selection. Say: *"pricing and placement are things that change, so I'd
+put them behind interfaces."*
+- **Fix ownership with smart pointers.** In a larger program the lot would own spots and
+tickets via `unique_ptr` so nothing leaks. Here I keep it simple with values and one
+non-owning pointer.
+- **Handle two entrances at once (concurrency).** If two cars race for the last spot both
+could grab it. Guard `parkVehicle` / `unparkVehicle` with a `mutex`, or use an atomic
+free-count per floor. Mention the race even if you don't code it.
+- **Speed up exit and availability.** Finding the spot on exit is a loop today. A
+`map<string, ParkingSpot*>` from id → spot makes it O(1); a cached free-count makes
+`countFree` O(1).
+- **Special spots / payment / persistence.** EV and handicapped bays = new `SpotType`
+values plus a rule; payment becomes its own class; storage becomes a database layer, all
+behind the same `ParkingLot` front door.
+
+---
+
+## 7. Likely follow-up questions + short answers
+
+- *Why is the vehicle held as a plain pointer?* — It just points at the parked car; the
+driver owns the car, not the lot. `nullptr` means the bay is empty.
+- *Why did you put `canFit` on the spot and `calculateFee` on the lot?* — Each behaviour
+sits with the data it needs. The fit rule needs the bay's size; pricing needs nothing but
+the type and hours and is a lot-level policy.
+- *How is "nearest" decided?* — Loop order: lower floors first, earlier spots first. To
+change the policy I'd swap in a different spot-finder (the Strategy idea).
+- *Where would this break under load?* — Two entrances parking at the same instant. Fix
+with a lock or an atomic free-count.
+- *How would you test it?* — `canFit` for every vehicle/spot pair, `calculateFee` for 0h,
+2.5h and each type, then park-until-full, unpark-and-reuse, and a bad ticket.
+- *How do you make exit O(1)?* — Keep a `map<string, ParkingSpot*>` from spot id to spot.
+
+---
+
+## 8. If you're running out of time
+
+Code in this priority order and say so: **enums → Vehicle → ParkingSpot (+ `canFit`) →
+ParkingLot with `parkVehicle`/`unparkVehicle`**. That alone is a working system. Floors,
+tickets, and the fee are next. The "level it up" items you can just *describe* — stating the
+upgrade earns most of the credit.
